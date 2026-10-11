@@ -682,6 +682,7 @@ app.post('/uzenetek-olvasott', vedett, async (req, res) => {
 async function pushErtesites(partnerId, felhasznaloId, talalkozasId) {
   try {
     const eszkozok = await dbPromise('SELECT push_token FROM push_eszkozok WHERE user_id = ?', [partnerId]);
+    console.log('[Push] Címzett:', partnerId, 'Eszközök:', eszkozok.length);
     for (let kezdet = 0; kezdet < eszkozok.length; kezdet += 100) {
       const adag = eszkozok.slice(kezdet, kezdet + 100);
       const response = await fetch('https://exp.host/--/api/v2/push/send', {
@@ -945,6 +946,60 @@ app.post('/szemelyfelvi', async (req, res) => {
       db.query('DELETE FROM regisztracio_kodok WHERE id = ?', [igazolas.id], (hiba) => {
         if (hiba) console.error('Regisztrációs igazolás takarítási hiba:', hiba);
       });
+
+      let ujTalalkozasId = null;
+
+      try {
+        const adminok = await dbPromise(
+          'SELECT Id FROM szemelyek WHERE is_admin = 1 ORDER BY Id ASC LIMIT 1',
+          []
+        );
+
+        if (adminok.length) {
+          const adminId = Number(adminok[0].Id);
+          const ujFelhasznaloId = Number(result.insertId);
+
+          const talalkozas = await dbPromise(
+            'INSERT INTO talalkozas (id_1, id_2, kezdes) VALUES (?, ?, NOW())',
+            [adminId, ujFelhasznaloId]
+          );
+
+          ujTalalkozasId = talalkozas.insertId;
+
+          const koszonto =
+            `Szia ${Felhasznalo}! Üdv a RandoTalkban!\n\n` +
+            'Keress új beszélgetőpartnereket, és ismerkedj a saját tempódban. ' +
+            'Ha kérdésed van vagy problémát tapasztalsz, ebben a beszélgetésben írhatsz nekünk.\n\n' +
+            'Jó beszélgetést!';
+
+          await dbPromise(
+            `INSERT INTO csevegesek
+              (aktualis_id, kuldo_id, uzenet, kep_url, olvasott)
+             VALUES (?, ?, ?, NULL, 0)`,
+            [ujTalalkozasId, adminId, encryptText(koszonto)]
+          );
+        } else {
+          console.warn('Köszöntő üzenet kihagyva: nincs adminfiók.');
+        }
+      } catch (error) {
+        console.error('Köszöntő üzenet küldési hiba:', error);
+
+        if (ujTalalkozasId !== null) {
+          try {
+            await dbPromise(
+              `DELETE FROM talalkozas
+               WHERE Id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM csevegesek WHERE aktualis_id = ?
+                 )`,
+              [ujTalalkozasId, ujTalalkozasId]
+            );
+          } catch (torlesiHiba) {
+            console.error('Üres köszöntő beszélgetés törlési hiba:', torlesiHiba);
+          }
+        }
+      }
+
       res.json({ sikeres: true });
     }
   );
