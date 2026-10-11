@@ -1,6 +1,34 @@
 const express = require('express');
 require('dotenv').config();
 
+const telepulesKoordinatak = require('./telepules-koordinatak.json');
+
+const telepulesNev = nev => String(nev || '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .trim()
+  .toLowerCase();
+
+const telepulesPontok = new Map(
+  Object.entries(telepulesKoordinatak).map(([nev, pont]) => [
+    telepulesNev(nev), pont
+  ])
+);
+
+function legvonalKm(a, b) {
+  const rad = fok => fok * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLon = rad(b.lon - a.lon);
+  const x = Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) *
+    Math.sin(dLon / 2) ** 2;
+  const ertek = Math.max(0, Math.min(1, x));
+  return 6371 * 2 * Math.atan2(
+    Math.sqrt(ertek),
+    Math.sqrt(1 - ertek)
+  );
+}
+
 const mysql = require('mysql');
 
 const cors = require('cors');
@@ -16,10 +44,10 @@ const { encryptText, decryptText, encryptFile, decryptFile } = require('./messag
 
 const smtp = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM
   ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587),
-      secure: Number(process.env.SMTP_PORT || 587) === 465,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    }) : null;
+    host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587),
+    secure: Number(process.env.SMTP_PORT || 587) === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+  }) : null;
 const dbPromise = (sql, params) => new Promise((resolve, reject) =>
   db.query(sql, params, (err, rows) => err ? reject(err) : resolve(rows)));
 const kodHash = (kod) => crypto.createHash('sha256').update(kod).digest('hex');
@@ -40,9 +68,11 @@ async function kodotKuldd(user, tipus) {
     [user.Id, tipus, kodHash(kod)]);
   try {
     console.log('[E-mail] Levél átadása az SMTP-szervernek.');
-    const info = await smtp.sendMail({ from: process.env.SMTP_FROM, to: user.Email,
+    const info = await smtp.sendMail({
+      from: process.env.SMTP_FROM, to: user.Email,
       subject: tipus === 'verify' ? 'Randotalk – e-mail-cím megerősítése' : 'Randotalk – új jelszó',
-      text: `A Randotalk kódod: ${kod}\nA kód 10 percig használható. Ha nem te kérted, hagyd figyelmen kívül ezt az üzenetet.` });
+      text: `A Randotalk kódod: ${kod}\nA kód 10 percig használható. Ha nem te kérted, hagyd figyelmen kívül ezt az üzenetet.`
+    });
     if (!info.accepted?.length) throw new Error('Az SMTP-szerver nem fogadta el a címzettet.');
     console.log('[E-mail] Az SMTP-szerver elfogadta a levelet. Ez még nem igazolja a beérkezést a postaládába.');
   } catch (error) {
@@ -92,6 +122,32 @@ const kepMappa = path.join(__dirname, 'feltoltott_kepek');
 fs.mkdirSync(kepMappa, { recursive: true });
 
 const munkamenetek = new Map();
+const onlineJelenlet = new Map();
+
+function felhasznaloOnline(id) {
+  const most = Date.now();
+
+  for (const adat of onlineJelenlet.values()) {
+    if (adat.aktiv &&
+      most - adat.frissitve < 15000 &&
+      felhasznaloTokenAlapjan(adat.token) === Number(id)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+setInterval(() => {
+  const most = Date.now();
+
+  for (const [kulcs, adat] of onlineJelenlet) {
+    if (most - adat.frissitve > 60000 ||
+      !felhasznaloTokenAlapjan(adat.token)) {
+      onlineJelenlet.delete(kulcs);
+    }
+  }
+}, 30000).unref();
 const TOKEN_ELETTARTAM = 24 * 60 * 60 * 1000;
 function felhasznaloTokenAlapjan(token) {
   const adat = token && munkamenetek.get(token);
@@ -165,7 +221,8 @@ const db = mysql.createConnection({
 
   password: '',
 
-  database: 'randotalk'
+  database: 'randotalk',
+  charset: 'utf8mb4'
 
 });
 
@@ -233,7 +290,7 @@ wss.on('connection', (ws) => {
 
 
 
-  ws.on('message', (message) => {
+  ws.on('message', async (message) => {
 
 
 
@@ -242,6 +299,47 @@ wss.on('connection', (ws) => {
 
 
       const data = JSON.parse(message.toString());
+
+      if (data.type === 'typing') {
+        const sajatId = felhasznaloTokenAlapjan(ws.munkamenetToken);
+        const partnerId = Number(data.partnerId);
+
+        if (!sajatId) {
+          ws.close(1008, 'Érvénytelen munkamenet');
+          return;
+        }
+
+        if (!Number.isInteger(partnerId) || partnerId <= 0 ||
+          partnerId === sajatId || typeof data.ir !== 'boolean') return;
+
+        const most = Date.now();
+        if (data.ir && most - (ws.utolsoGepeles || 0) < 500) return;
+        ws.utolsoGepeles = most;
+
+        const keresSzam = ws.gepelesKeres = (ws.gepelesKeres || 0) + 1;
+
+        const partner = await dbPromise(
+          'SELECT Id FROM szemelyek WHERE Id = ?',
+          [partnerId]
+        );
+
+        if (!partner.length || await tiltottPar(sajatId, partnerId)) return;
+        if (keresSzam !== ws.gepelesKeres) return;
+        if (felhasznaloTokenAlapjan(ws.munkamenetToken) !== sajatId) return;
+
+        const partnerSocket = kliensek.get(String(partnerId));
+
+        if (partnerSocket?.readyState === WebSocket.OPEN &&
+          felhasznaloTokenAlapjan(partnerSocket.munkamenetToken) === partnerId) {
+          partnerSocket.send(JSON.stringify({
+            type: 'typing',
+            partnerId: sajatId,
+            ir: data.ir
+          }));
+        }
+
+        return;
+      }
 
 
 
@@ -492,7 +590,7 @@ app.post('/admin/felhasznalo-torles', vedett, adminVedett, async (req, res) => {
     }
     res.json({ sikeres: true });
   } catch (error) {
-    try { await query('ROLLBACK'); } catch (_) {}
+    try { await query('ROLLBACK'); } catch (_) { }
     console.error('Admin fióktörlési hiba:', error);
     res.status(500).send('A törlés sikertelen.');
   } finally { kapcsolat.end(); }
@@ -538,7 +636,7 @@ app.post('/sajat-fiok-torles', vedett, async (req, res) => {
     }
     res.json({ sikeres: true });
   } catch (error) {
-    try { await query('ROLLBACK'); } catch (_) {}
+    try { await query('ROLLBACK'); } catch (_) { }
     console.error('Admin fióktörlési hiba:', error);
     res.status(500).send('A törlés sikertelen.');
   } finally { kapcsolat.end(); }
@@ -589,9 +687,11 @@ async function pushErtesites(partnerId, felhasznaloId, talalkozasId) {
       const response = await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST', signal: AbortSignal.timeout(10000),
         headers: { 'Content-Type': 'application/json', ...(process.env.EXPO_ACCESS_TOKEN ? { Authorization: `Bearer ${process.env.EXPO_ACCESS_TOKEN}` } : {}) },
-        body: JSON.stringify(adag.map((e) => ({ to: e.push_token, title: 'Randotalk',
+        body: JSON.stringify(adag.map((e) => ({
+          to: e.push_token, title: 'Randotalk',
           body: 'Új üzeneted érkezett.', sound: 'default', channelId: 'uzenetek', priority: 'high',
-          data: { talalkozasId, partnerId: felhasznaloId } })))
+          data: { talalkozasId, partnerId: felhasznaloId }
+        })))
       });
       if (!response.ok) throw new Error('Expo push HTTP ' + response.status);
       const valasz = await response.json();
@@ -719,7 +819,7 @@ app.post('/regisztracio-kod', async (req, res) => {
   const email = emailCim(req.body.Email);
   const jelszo = req.body.Jelszo;
   if (!nev || nev.length > 100 || email.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
-      typeof jelszo !== 'string' || jelszo.length < 8 || jelszo.length > 100 || jelszo !== req.body.JelszoUjra)
+    typeof jelszo !== 'string' || jelszo.length < 8 || jelszo.length > 100 || jelszo !== req.body.JelszoUjra)
     return res.status(400).send('Érvényes e-mail-cím, felhasználónév és két egyező, legalább 8 karakteres jelszó szükséges.');
   if (!kuldesEngedelyezett(req)) return res.status(429).send('Túl sok kérés. Próbáld később.');
   if (!smtp) return res.status(503).send('Az e-mail küldés nincs beállítva.');
@@ -735,9 +835,11 @@ app.post('/regisztracio-kod', async (req, res) => {
     await dbPromise(`INSERT INTO regisztracio_kodok (id, email, felhasznalo, jelszo_hash, kod_hash, expires_at, sent_at)
       VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE), NOW())`, [id, email, nev, jelszoHash(jelszo), kodHash(kod)]);
     try {
-      const info = await smtp.sendMail({ from: process.env.SMTP_FROM, to: email,
+      const info = await smtp.sendMail({
+        from: process.env.SMTP_FROM, to: email,
         subject: 'Randotalk – e-mail-cím megerősítése',
-        text: `A regisztrációs kódod: ${kod}\nA kód 10 percig érvényes. Ha nem te kérted, hagyd figyelmen kívül.` });
+        text: `A regisztrációs kódod: ${kod}\nA kód 10 percig érvényes. Ha nem te kérted, hagyd figyelmen kívül.`
+      });
       if (!info.accepted?.length) throw new Error('A címzettet az SMTP-szerver nem fogadta el.');
     } catch (error) {
       await dbPromise('DELETE FROM regisztracio_kodok WHERE id = ?', [id]);
@@ -782,10 +884,10 @@ app.post('/szemelyfelvi', async (req, res) => {
   const profilkepBase64 = req.body.profilkepBase64;
 
   if (!Felhasznalo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(Email) || !Jelszo || Felhasznalo.length > 100 ||
-      Email.length > 200 || Jelszo.length > 100 ||
-      (lakhely && lakhely.length > 100) ||
-      (nem && !['Nő', 'Férfi', 'Egyéb'].includes(nem)) ||
-      (eletkor !== null && (!Number.isInteger(eletkor) || eletkor < 18 || eletkor > 80))) {
+    Email.length > 200 || Jelszo.length > 100 ||
+    (lakhely && lakhely.length > 100) ||
+    (nem && !['Nő', 'Férfi', 'Egyéb'].includes(nem)) ||
+    (eletkor !== null && (!Number.isInteger(eletkor) || eletkor < 18 || eletkor > 80))) {
     return res.status(400).send('Hiányzó vagy hibás regisztrációs adat');
   }
   let igazolas;
@@ -809,14 +911,14 @@ app.post('/szemelyfelvi', async (req, res) => {
   let profilkepFajl = null;
   if (profilkepBase64) {
     if (typeof profilkepBase64 !== 'string' ||
-        !/^[A-Za-z0-9+/]+={0,2}$/.test(profilkepBase64) ||
-        profilkepBase64.length > 5600000) {
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(profilkepBase64) ||
+      profilkepBase64.length > 5600000) {
       return res.status(400).send('Érvénytelen vagy túl nagy profilkép');
     }
     const bytes = Buffer.from(profilkepBase64, 'base64');
     if (bytes.length > 4 * 1024 * 1024 || bytes.length < 4 ||
-        bytes[0] !== 0xff || bytes[1] !== 0xd8 ||
-        bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9) {
+      bytes[0] !== 0xff || bytes[1] !== 0xd8 ||
+      bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9) {
       return res.status(400).send('Legfeljebb 4 MB-os JPEG kép tölthető fel');
     }
     const nev = crypto.randomUUID() + '.jpg';
@@ -836,7 +938,7 @@ app.post('/szemelyfelvi', async (req, res) => {
   db.query(sql, [Felhasznalo, Email, igazolas.jelszo_hash, nem, lakhely, eletkor, profilkepUrl],
     async (err, result) => {
       if (err) {
-        if (profilkepFajl) fs.unlink(profilkepFajl, () => {});
+        if (profilkepFajl) fs.unlink(profilkepFajl, () => { });
         console.error('Regisztrációs hiba:', err);
         return res.status(err.code === 'ER_DUP_ENTRY' ? 409 : 500).send(err.code === 'ER_DUP_ENTRY' ? 'A felhasználónév vagy e-mail-cím már foglalt.' : 'Nem sikerült regisztrálni');
       }
@@ -912,17 +1014,41 @@ app.post('/jelszo-visszaallitas', async (req, res) => {
   }
 });
 
-app.get('/profil/:id', vedett, (req, res) => {
-  db.query(
-    `SELECT Id, Felhasznalo, nem, lakhely, eletkor, profilkep_url
-     FROM szemelyek WHERE Id = ? LIMIT 1`,
-    [req.params.id],
-    (err, rows) => {
-      if (err) return res.status(500).send('Adatbázis hiba');
-      if (!rows.length) return res.status(404).send('Nincs ilyen felhasználó');
-      res.json(rows[0]);
+app.get('/profil/:id', vedett, async (req, res) => {
+  const partnerId = Number(req.params.id);
+  if (!Number.isSafeInteger(partnerId) || partnerId <= 0)
+    return res.status(400).send('Hibás felhasználóazonosító');
+
+  try {
+    const rows = await dbPromise(`
+      SELECT s.Id, s.Felhasznalo, s.nem, s.lakhely,
+        s.eletkor, s.profilkep_url,
+        en.lakhely AS sajatLakhely
+      FROM szemelyek s
+      JOIN szemelyek en ON en.Id = ?
+      WHERE s.Id = ?
+      LIMIT 1
+    `, [req.felhasznaloId, partnerId]);
+
+    if (!rows.length)
+      return res.status(404).send('A profil nem található');
+
+    const { sajatLakhely, ...profil } = rows[0];
+    const sajatPont = telepulesPontok.get(telepulesNev(sajatLakhely));
+    const partnerPont = telepulesPontok.get(telepulesNev(profil.lakhely));
+
+    let tavolsagKm = null;
+    if (partnerId !== req.felhasznaloId && sajatPont && partnerPont) {
+      const tavolsag = legvonalKm(sajatPont, partnerPont);
+      if (Number.isFinite(tavolsag))
+        tavolsagKm = Math.round(tavolsag);
     }
-  );
+
+    res.json({ ...profil, tavolsagKm });
+  } catch (error) {
+    console.error('Profil lekérési hiba:', error);
+    res.status(500).send('A profil lekérése sikertelen');
+  }
 });
 
 
@@ -958,8 +1084,8 @@ app.post('/jelentes', vedett, async (req, res) => {
   const ok = req.body.ok;
   const leiras = typeof req.body.leiras === 'string' ? req.body.leiras.trim() : '';
   if (!Number.isInteger(partnerId) || partnerId <= 0 || partnerId === req.felhasznaloId ||
-      !Number.isInteger(talalkozasId) || talalkozasId <= 0 ||
-      !['Zaklatás', 'Sértő tartalom', 'Spam', 'Egyéb'].includes(ok) || leiras.length > 1000)
+    !Number.isInteger(talalkozasId) || talalkozasId <= 0 ||
+    !['Zaklatás', 'Sértő tartalom', 'Spam', 'Egyéb'].includes(ok) || leiras.length > 1000)
     return res.status(400).send('Hibás jelentési adatok');
   try {
     const rows = await dbPromise('SELECT Id FROM talalkozas WHERE Id = ? AND ((id_1 = ? AND id_2 = ?) OR (id_1 = ? AND id_2 = ?))',
@@ -980,179 +1106,97 @@ app.post('/uzenet', vedett, async (req, res, next) => {
   } catch (error) { console.error('Tiltás ellenőrzési hiba:', error); res.status(500).send('Adatbázis hiba'); }
 });
 
-app.get('/random/:id', vedett, (req, res) => {
-  if (Number(req.params.id) !== req.felhasznaloId) return res.status(403).send('Nincs hozzáférés');
+app.get('/random/:id', vedett, async (req, res) => {
+  const id = req.felhasznaloId;
+  if (Number(req.params.id) !== id)
+    return res.status(403).send('Nincs hozzáférés');
 
+  try {
+    const sajatSorok = await dbPromise(`
+      SELECT s.lakhely, s.eletkor,
+        COALESCE(p.kor_min, 18) AS korMin,
+        COALESCE(p.kor_max, 80) AS korMax,
+        COALESCE(p.tavolsag_km, 50) AS tavolsagKm
+      FROM szemelyek s
+      LEFT JOIN partner_keresesi_beallitasok p
+        ON p.felhasznalo_id = s.Id
+      WHERE s.Id = ?
+    `, [id]);
 
+    if (!sajatSorok.length)
+      return res.status(404).send('A profil nem található');
 
-  const felhasznaloId = req.params.id;
+    const sajat = sajatSorok[0];
+    const sajatPont = telepulesPontok.get(telepulesNev(sajat.lakhely));
 
+    if (!sajatPont)
+      return res.status(400).send(
+        'A profilod településéhez nem található koordináta. Ellenőrizd a profilban megadott települést.'
+      );
 
-
-  const sql = `
-
-    SELECT
-
-      s.Id AS partnerId,
-
-      s.Felhasznalo AS partnerNev
-
-
-
-    FROM szemelyek s
-
-
-
-    WHERE s.Id != ?
-    AND NOT EXISTS (SELECT 1 FROM tiltasok b WHERE
-      (b.tilto_id = ? AND b.tiltott_id = s.Id) OR
-      (b.tiltott_id = ? AND b.tilto_id = s.Id))
-
-
-
-    AND NOT EXISTS (
-
-
-
-      SELECT 1
-
-      FROM talalkozas t
-
-
-
-      WHERE
-
-        (
-
-          t.id_1 = ?
-
-          AND
-
-          t.id_2 = s.Id
-
+    const jeloltek = await dbPromise(`
+      SELECT s.Id AS partnerId, s.Felhasznalo AS partnerNev,
+        s.lakhely, s.eletkor,
+        COALESCE(p.kor_min, 18) AS korMin,
+        COALESCE(p.kor_max, 80) AS korMax,
+        COALESCE(p.tavolsag_km, 50) AS tavolsagKm
+      FROM szemelyek s
+      LEFT JOIN partner_keresesi_beallitasok p
+        ON p.felhasznalo_id = s.Id
+      WHERE s.Id <> ?
+        AND NOT EXISTS (
+          SELECT 1 FROM tiltasok b
+          WHERE (b.tilto_id = ? AND b.tiltott_id = s.Id)
+             OR (b.tiltott_id = ? AND b.tilto_id = s.Id)
         )
-
-
-
-        OR
-
-
-
-        (
-
-          t.id_2 = ?
-
-          AND
-
-          t.id_1 = s.Id
-
+        AND NOT EXISTS (
+          SELECT 1 FROM talalkozas t
+          WHERE (t.id_1 = ? AND t.id_2 = s.Id)
+             OR (t.id_2 = ? AND t.id_1 = s.Id)
         )
-
-
-
-    )
-
-
-
-    ORDER BY RAND()
-
-
-
-    LIMIT 1
-
-  `;
-
-
-
-
-
-  db.query(
-
-    sql,
-
-    [
-
-      felhasznaloId,
-      felhasznaloId,
-      felhasznaloId,
-      felhasznaloId,
-      felhasznaloId
-
-    ],
-
-    (err, rows) => {
-
-
-
-      if (err) {
-
-
-
-        console.error(
-
-          'Partner keresési hiba:',
-
-          err
-
-        );
-
-
-
-        return res
-
-          .status(500)
-
-          .send('Adatbázis hiba');
-
-      }
-
-
-
-
-
-      if (rows.length === 0) {
-
-
-
-        return res
-
-          .status(404)
-
-          .send('Nincs új partner');
-
-      }
-
-
-
-
-
-      res.json({
-
-
-
-        partnerId: rows[0].partnerId,
-
-
-
-        partnerNev: rows[0].partnerNev
-
-
-
-      });
-
-
-
-    }
-
-  );
-
-
-
+    `, [id, id, id, id, id]);
+
+    const talalatok = jeloltek.filter(jelolt => {
+      const jeloltPont = telepulesPontok.get(
+        telepulesNev(jelolt.lakhely)
+      );
+      if (!jeloltPont) return false;
+
+      const tavolsag = legvonalKm(sajatPont, jeloltPont);
+      if (tavolsag > Number(sajat.tavolsagKm) ||
+        tavolsag > Number(jelolt.tavolsagKm)) return false;
+
+      const partnerKorMegfelel = jelolt.eletkor == null
+        ? Number(sajat.korMin) === 18 && Number(sajat.korMax) === 80
+        : Number(jelolt.eletkor) >= Number(sajat.korMin) &&
+        Number(jelolt.eletkor) <= Number(sajat.korMax);
+
+      const sajatKorMegfelel = sajat.eletkor == null
+        ? Number(jelolt.korMin) === 18 && Number(jelolt.korMax) === 80
+        : Number(sajat.eletkor) >= Number(jelolt.korMin) &&
+        Number(sajat.eletkor) <= Number(jelolt.korMax);
+
+      return partnerKorMegfelel && sajatKorMegfelel;
+    });
+
+    if (!talalatok.length)
+      return res.status(404).send(
+        'Nincs a keresési beállításoknak megfelelő új partner'
+      );
+
+    const partner = talalatok[
+      Math.floor(Math.random() * talalatok.length)
+    ];
+
+    res.json({
+      partnerId: partner.partnerId,
+      partnerNev: partner.partnerNev
+    });
+  } catch (error) {
+    console.error('Partnerkeresési hiba:', error);
+    res.status(500).send('A partnerkeresés sikertelen');
+  }
 });
-
-
-
-
 
 // =========================
 
@@ -1162,7 +1206,7 @@ app.get('/random/:id', vedett, (req, res) => {
 
 
 
-app.post('/uzenet', vedett, (req, res) => {
+app.post('/uzenet', vedett, async (req, res) => {
 
 
 
@@ -1175,7 +1219,51 @@ app.post('/uzenet', vedett, (req, res) => {
     return res.status(400).send('Hibás partner');
   }
 
+  let valasz = null;
 
+  if (req.body.valaszUzenetId != null) {
+    const valaszId = req.body.valaszUzenetId;
+
+    if (!Number.isInteger(valaszId) || valaszId <= 0) {
+      return res.status(400).send('Hibás válaszüzenet-azonosító');
+    }
+
+    try {
+      const sorok = await dbPromise(`
+      SELECT c.id, c.aktualis_id, c.kuldo_id, c.uzenet, c.kep_url
+      FROM csevegesek c
+      JOIN talalkozas t ON t.Id = c.aktualis_id
+      WHERE c.id = ? AND c.visszavont = 0
+        AND (
+          (t.id_1 = ? AND t.id_2 = ?)
+          OR (t.id_1 = ? AND t.id_2 = ?)
+        )
+      LIMIT 1
+    `, [
+        valaszId,
+        felhasznaloId,
+        partnerId,
+        partnerId,
+        felhasznaloId
+      ]);
+
+      if (!sorok.length) {
+        return res.status(403).send(
+          'Erre az üzenetre ebben a beszélgetésben nem válaszolhatsz.'
+        );
+      }
+
+      valasz = {
+        ...sorok[0],
+        uzenet: decryptText(sorok[0].uzenet).slice(0, 300)
+      };
+    } catch (error) {
+      console.error('Válaszüzenet ellenőrzési hiba:', error);
+      return res.status(500).send(
+        'A válaszüzenet ellenőrzése sikertelen'
+      );
+    }
+  }
 
   const uzenet = typeof req.body.uzenet === 'string' ? req.body.uzenet.trim() : '';
   const kepBase64 = req.body.kepBase64;
@@ -1183,8 +1271,8 @@ app.post('/uzenet', vedett, (req, res) => {
   let kepUrl = null;
   if (kepBase64 !== undefined) {
     if (typeof kepBase64 !== 'string' ||
-        !/^[A-Za-z0-9+/]+={0,2}$/.test(kepBase64) ||
-        kepBase64.length > 5600000) {
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(kepBase64) ||
+      kepBase64.length > 5600000) {
       return res.status(400).send('Érvénytelen vagy túl nagy kép');
     }
     const bytes = Buffer.from(kepBase64, 'base64');
@@ -1193,7 +1281,7 @@ app.post('/uzenet', vedett, (req, res) => {
     const gif = bytes.length >= 14 && ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii')) &&
       bytes[bytes.length - 1] === 0x3b;
     if (bytes.length > 4 * 1024 * 1024 ||
-        !((kepFormat === 'jpeg' && jpeg) || (kepFormat === 'gif' && gif))) {
+      !((kepFormat === 'jpeg' && jpeg) || (kepFormat === 'gif' && gif))) {
       return res.status(400).send('Legfeljebb 4 MB-os JPEG kép vagy GIF küldhető');
     }
     const nev = crypto.randomUUID() + (kepFormat === 'gif' ? '.gif' : '.jpg');
@@ -1443,14 +1531,12 @@ app.post('/uzenet', vedett, (req, res) => {
             uzenetMentese(
 
               talalkozasId,
-
               felhasznaloId,
-
               partnerId,
-
               uzenet,
               kepUrl,
-              res
+              res,
+              valasz
 
             );
 
@@ -1496,7 +1582,8 @@ app.post('/uzenet', vedett, (req, res) => {
 
           uzenet,
           kepUrl,
-          res
+          res,
+          valasz
 
         );
 
@@ -1527,233 +1614,94 @@ app.post('/uzenet', vedett, (req, res) => {
 
 
 function uzenetMentese(
-
   talalkozasId,
-
   felhasznaloId,
-
   partnerId,
-
   uzenet,
   kepUrl,
-  res
-
+  res,
+  valasz = null
 ) {
-
-
-
-  const uzenetSql = `
-
-    INSERT INTO csevegesek
-
-    (
-
-      aktualis_id,
-
-      kuldo_id,
-
-      uzenet,
-      kep_url
-
-    )
-
-    VALUES
-
-    (
-
-      ?,
-
-      ?,
-
-      ?,
-      ?
-
-    )
-
-  `;
-
-
-
-
-
-  db.query(
-
-    uzenetSql,
-
-    [
-
-      talalkozasId,
-
-      felhasznaloId,
-
-      encryptText(uzenet),
-      kepUrl
-
-    ],
-
-    (err, result) => {
-
-
-
-      if (err) {
-
-
-
-        console.error(
-
-          'Üzenet mentési hiba:',
-
-          err
-
-        );
-
-
-
-        return res
-
-          .status(500)
-
-          .send('Üzenet mentési hiba');
-
-
-
-      }
-
-
-
-
-
-      const uzenetId =
-
-        result.insertId;
-
-      void pushErtesites(partnerId, felhasznaloId, talalkozasId);
-
-
-
-
-
-      // =========================
-
-      // WEBSOCKET ÉRTESÍTÉS
-
-      // =========================
-
-
-
-      const partnerSocket =
-
-        kliensek.get(String(partnerId));
-
-
-
-
-
-      if (
-
-        partnerSocket &&
-
-        partnerSocket.readyState === WebSocket.OPEN &&
-        felhasznaloTokenAlapjan(partnerSocket.munkamenetToken) === Number(partnerId)
-
-      ) {
-
-
-
-        partnerSocket.send(
-
-          JSON.stringify({
-
-
-
-            type: 'newMessage',
-
-
-
-            talalkozasId: talalkozasId,
-
-
-
-            partnerId: partnerId,
-
-
-
-            message: {
-
-
-
-              id: uzenetId,
-
-
-
-              aktualis_id: talalkozasId,
-
-
-
-              kuldo_id: felhasznaloId,
-
-
-
-              uzenet: uzenet,
-              kep_url: kepUrl
-
-
-
-            }
-
-
-
-          })
-
-        );
-
-
-
-
-
-        console.log(
-
-          'WebSocket üzenet elküldve:',
-
-          partnerId
-
-        );
-
-
-
-      }
-
-
-
-
-
-      res.json({
-
-
-
-        sikeres: true,
-
-
-
-        talalkozasId: talalkozasId,
-
-
-
-        uzenetId: uzenetId,
-        kepUrl: kepUrl
-
-
-
-      });
-
-
-
+  if (valasz &&
+    Number(valasz.aktualis_id) !== Number(talalkozasId)) {
+    if (kepUrl) {
+      fs.unlink(
+        path.join(kepMappa, path.basename(kepUrl)),
+        () => { }
+      );
     }
 
+    return res.status(400).send(
+      'A válaszüzenet másik beszélgetéshez tartozik.'
+    );
+  }
+
+  const uzenetSql = `
+    INSERT INTO csevegesek
+      (aktualis_id, kuldo_id, uzenet, kep_url, valasz_uzenet_id)
+    VALUES (?, ?, ?, ?, ?)
+  `;
+
+  db.query(
+    uzenetSql,
+    [
+      talalkozasId,
+      felhasznaloId,
+      encryptText(uzenet),
+      kepUrl,
+      valasz?.id || null
+    ],
+    (err, result) => {
+      if (err) {
+        if (kepUrl) {
+          fs.unlink(
+            path.join(kepMappa, path.basename(kepUrl)),
+            () => { }
+          );
+        }
+
+        console.error('Üzenet mentési hiba:', err);
+        return res.status(500).send('Üzenet mentési hiba');
+      }
+
+      const uzenetId = result.insertId;
+      void pushErtesites(partnerId, felhasznaloId, talalkozasId);
+
+      const partnerSocket = kliensek.get(String(partnerId));
+
+      if (
+        partnerSocket &&
+        partnerSocket.readyState === WebSocket.OPEN &&
+        felhasznaloTokenAlapjan(
+          partnerSocket.munkamenetToken
+        ) === Number(partnerId)
+      ) {
+        partnerSocket.send(JSON.stringify({
+          type: 'newMessage',
+          talalkozasId,
+          partnerId,
+          message: {
+            id: uzenetId,
+            aktualis_id: talalkozasId,
+            kuldo_id: felhasznaloId,
+            uzenet,
+            kep_url: kepUrl,
+            valasz_uzenet_id: valasz?.id || null,
+            valasz
+          }
+        }));
+      }
+
+      res.json({
+        sikeres: true,
+        talalkozasId,
+        uzenetId,
+        kepUrl,
+        valasz_uzenet_id: valasz?.id || null,
+        valasz
+      });
+    }
   );
-
-
-
 }
 
 
@@ -1804,11 +1752,12 @@ app.get('/beszelgetesek/:id', vedett, (req, res) => {
 
 
       s.Felhasznalo AS partnerNev,
-
+      c.visszavont AS utolsoVisszavont,
       s.profilkep_url AS partnerKepUrl,
 
       c.id AS utolsoUzenetId,
       c.kuldo_id AS utolsoKuldoId,
+      c.olvasott AS utolsoOlvasott,
       (SELECT COUNT(*) FROM csevegesek cu WHERE cu.aktualis_id = t.Id
         AND cu.kuldo_id = s.Id AND cu.olvasott = 0) AS olvasatlan,
 
@@ -1944,7 +1893,11 @@ app.get('/beszelgetesek/:id', vedett, (req, res) => {
       try {
         res.json(rows.map((row) => ({
           ...row,
-          utolsoUzenet: row.utolsoUzenet == null ? null : decryptText(row.utolsoUzenet)
+          utolsoUzenet: Number(row.utolsoVisszavont) === 1
+            ? 'Az üzenetet visszavonták'
+            : row.utolsoUzenet == null
+              ? null
+              : decryptText(row.utolsoUzenet)
         })));
       } catch (error) {
         console.error('Üzenet visszafejtési hiba:', error);
@@ -1962,7 +1915,164 @@ app.get('/beszelgetesek/:id', vedett, (req, res) => {
 });
 
 
+app.post('/profil-szerkesztes', vedett, async (req, res) => {
+  const nem = req.body.nem == null || req.body.nem === '' ? null : req.body.nem;
+  const lakhely = req.body.lakhely == null ? null : req.body.lakhely;
+  const eletkor = req.body.eletkor == null ? null : req.body.eletkor;
 
+  if ((nem !== null && !['Nő', 'Férfi', 'Egyéb'].includes(nem)) ||
+    (lakhely !== null && (typeof lakhely !== 'string' || lakhely.length > 100)) ||
+    (eletkor !== null &&
+      (!Number.isInteger(eletkor) || eletkor < 18 || eletkor > 80)) ||
+    (req.body.kepTorles !== undefined &&
+      typeof req.body.kepTorles !== 'boolean')) {
+    return res.status(400).send('Hibás profiladatok');
+  }
+
+  let ujFajl = null;
+  let ujKep = null;
+
+  try {
+    const letezik = await dbPromise(
+      'SELECT Id FROM szemelyek WHERE Id = ?',
+      [req.felhasznaloId]
+    );
+    if (!letezik.length) return res.status(404).send('A fiók nem található');
+
+    if (req.body.profilkepBase64 !== undefined) {
+      const adat = req.body.profilkepBase64;
+
+      if (req.body.kepTorles ||
+        typeof adat !== 'string' ||
+        adat.length > 5600000 ||
+        !/^[A-Za-z0-9+/]+={0,2}$/.test(adat)) {
+        return res.status(400).send('Érvénytelen vagy túl nagy profilkép');
+      }
+
+      const bytes = Buffer.from(adat, 'base64');
+      const jpeg = bytes.length >= 4 &&
+        bytes.length <= 4 * 1024 * 1024 &&
+        bytes[0] === 0xff && bytes[1] === 0xd8 &&
+        bytes[bytes.length - 2] === 0xff &&
+        bytes[bytes.length - 1] === 0xd9;
+
+      if (!jpeg) {
+        return res.status(400).send('Legfeljebb 4 MB-os JPEG profilkép küldhető');
+      }
+
+      const nev = crypto.randomUUID() + '.jpg';
+      ujFajl = path.join(kepMappa, nev);
+      fs.writeFileSync(ujFajl, encryptFile(bytes), { flag: 'wx' });
+      ujKep = '/feltoltott_kepek/' + nev;
+    }
+
+    const kepValtozik = Boolean(ujKep || req.body.kepTorles);
+    const sql = kepValtozik
+      ? 'UPDATE szemelyek SET nem = ?, lakhely = ?, eletkor = ?, profilkep_url = ? WHERE Id = ?'
+      : 'UPDATE szemelyek SET nem = ?, lakhely = ?, eletkor = ? WHERE Id = ?';
+    const adatok = kepValtozik
+      ? [nem, lakhely ? lakhely.trim() || null : null, eletkor, ujKep, req.felhasznaloId]
+      : [nem, lakhely ? lakhely.trim() || null : null, eletkor, req.felhasznaloId];
+
+    await dbPromise(sql, adatok);
+    ujFajl = null;
+
+    const profil = await dbPromise(
+      'SELECT Id, Felhasznalo, nem, lakhely, eletkor, profilkep_url FROM szemelyek WHERE Id = ?',
+      [req.felhasznaloId]
+    );
+    if (!profil.length) return res.status(404).send('A fiók nem található');
+    res.json(profil[0]);
+  } catch (error) {
+    if (ujFajl) fs.unlink(ujFajl, () => { });
+    console.error('Profil szerkesztési hiba:', error);
+    res.status(500).send('A profil mentése sikertelen');
+  }
+});
+
+
+app.get('/tiltottak', vedett, async (req, res) => {
+  try {
+    const rows = await dbPromise(
+      `SELECT s.Id, s.Felhasznalo, s.profilkep_url
+       FROM tiltasok t
+       JOIN szemelyek s ON s.Id = t.tiltott_id
+       WHERE t.tilto_id = ?
+       ORDER BY s.Felhasznalo`,
+      [req.felhasznaloId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Letiltottak lekérési hiba:', error);
+    res.status(500).send('A tiltott felhasználók lekérése sikertelen');
+  }
+});
+
+app.get('/partner-beallitasok', vedett, async (req, res) => {
+  try {
+    const rows = await dbPromise(
+      'SELECT kor_min AS korMin, kor_max AS korMax, tavolsag_km AS tavolsagKm FROM partner_keresesi_beallitasok WHERE felhasznalo_id = ?',
+      [req.felhasznaloId]
+    );
+    res.json(rows[0] || { korMin: 18, korMax: 80, tavolsagKm: 50 });
+  } catch (error) {
+    console.error('Partnerkeresési beállítások lekérési hiba:', error);
+    res.status(500).send('A beállítások lekérése sikertelen');
+  }
+});
+app.post('/partner-beallitasok', vedett, async (req, res) => {
+  const korMin = Number(req.body.korMin);
+  const korMax = Number(req.body.korMax);
+  const tavolsagKm = Number(req.body.tavolsagKm);
+  if (
+    !Number.isInteger(korMin) ||
+    !Number.isInteger(korMax) ||
+    korMin < 18 ||
+    korMax > 80 ||
+    korMin > korMax ||
+    !Number.isInteger(tavolsagKm) ||
+    tavolsagKm < 10 ||
+    tavolsagKm > 500
+  ) {
+    return res.status(400).send('Érvénytelen korhatár vagy távolság');
+  }
+  try {
+    await dbPromise(`INSERT INTO partner_keresesi_beallitasok (felhasznalo_id, kor_min, kor_max, tavolsag_km)
+      VALUES (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE kor_min = VALUES(kor_min), kor_max = VALUES(kor_max), tavolsag_km = VALUES(tavolsag_km)`,
+      [req.felhasznaloId, korMin, korMax, tavolsagKm]);
+    res.json({ sikeres: true });
+  }
+  catch (error) {
+    console.error('Partnerkeresési beállítások mentési hiba:', error);
+    res.status(500).send('A beállítások mentése sikertelen');
+  }
+});
+
+app.post('/tiltas-feloldasa', vedett, async (req, res) => {
+  const partnerId = Number(req.body.partnerId);
+
+  if (!Number.isInteger(partnerId) || partnerId <= 0 || partnerId === req.felhasznaloId) {
+    return res.status(400).send('Hibás felhasználóazonosító');
+  }
+
+  try {
+    const result = await dbPromise(
+      'DELETE FROM tiltasok WHERE tilto_id = ? AND tiltott_id = ?',
+      [req.felhasznaloId, partnerId]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).send('Ez a felhasználó nincs letiltva általad');
+    }
+
+    res.json({ sikeres: true });
+  } catch (error) {
+    console.error('Tiltás feloldási hiba:', error);
+    res.status(500).send('A tiltás feloldása sikertelen');
+  }
+});
 
 
 // =========================
@@ -1974,91 +2084,83 @@ app.get('/beszelgetesek/:id', vedett, (req, res) => {
 
 
 app.get('/uzenetek/:talalkozasId', vedett, (req, res) => {
-
-
-
-  const talalkozasId =
-
-    req.params.talalkozasId;
-
-
-
-
+  const talalkozasId = req.params.talalkozasId;
 
   const sql = `
-
-    SELECT c.id, c.aktualis_id, c.kuldo_id, c.uzenet, c.kep_url
-
+    SELECT
+      c.id,
+      c.aktualis_id,
+      c.kuldo_id,
+      c.uzenet,
+      c.kep_url,
+      c.olvasott,
+      c.valasz_uzenet_id,
+      v.id AS valaszId,
+      v.kuldo_id AS valaszKuldoId,
+      v.uzenet AS valaszSzoveg,
+      v.kep_url AS valaszKepUrl,
+      c.visszavont,
+v.visszavont AS valaszVisszavont,
+r.emoji AS reakcioEmoji,
+r.felhasznalo_id AS reakcioFelhasznaloId
     FROM csevegesek c
-
-
-
     JOIN talalkozas t ON t.Id = c.aktualis_id
-    WHERE c.aktualis_id = ? AND (t.id_1 = ? OR t.id_2 = ?)
-
-
-
+    LEFT JOIN csevegesek v
+      ON v.id = c.valasz_uzenet_id
+      AND v.aktualis_id = c.aktualis_id
+    LEFT JOIN uzenet_reakciok r ON r.uzenet_id = c.id
+    WHERE c.aktualis_id = ?
+      AND (t.id_1 = ? OR t.id_2 = ?)
     ORDER BY c.id ASC
-
   `;
 
-
-
-
-
   db.query(
-
     sql,
-
     [talalkozasId, req.felhasznaloId, req.felhasznaloId],
-
     (err, rows) => {
-
-
-
       if (err) {
-
-
-
-        console.error(
-
-          'Üzenetek lekérési hiba:',
-
-          err
-
-        );
-
-
-
-        return res
-
-          .status(500)
-
-          .send('Adatbázis hiba');
-
-
-
+        console.error('Üzenetek lekérési hiba:', err);
+        return res.status(500).send('Adatbázis hiba');
       }
 
-
-
-
-
       try {
-        res.json(rows.map((row) => ({ ...row, uzenet: decryptText(row.uzenet) })));
+        res.json(rows.map(row => {
+          const {
+            valaszId,
+            valaszKuldoId,
+            valaszSzoveg,
+            valaszKepUrl,
+            reakcioEmoji,
+            reakcioFelhasznaloId,
+            valaszVisszavont,
+            ...adat
+          } = row;
+
+          return {
+            ...adat,
+            reakcio: Number(adat.visszavont) === 1 || reakcioEmoji == null
+              ? null
+              : {
+                emoji: reakcioEmoji,
+                felhasznaloId: Number(reakcioFelhasznaloId)
+              },
+            uzenet: Number(adat.visszavont) === 1
+              ? ''
+              : decryptText(adat.uzenet),
+            valasz: valaszId == null || Number(valaszVisszavont) === 1 ? null : {
+              id: valaszId,
+              kuldo_id: valaszKuldoId,
+              uzenet: decryptText(valaszSzoveg).slice(0, 300),
+              kep_url: valaszKepUrl,
+            }
+          };
+        }));
       } catch (error) {
         console.error('Üzenet visszafejtési hiba:', error);
         res.status(500).send('Az üzenet nem olvasható');
       }
-
-
-
     }
-
   );
-
-
-
 });
 
 
@@ -2071,7 +2173,247 @@ app.get('/uzenetek/:talalkozasId', vedett, (req, res) => {
 
 // =========================
 
+app.post('/online-allapot', vedett, async (req, res) => {
+  const { kliensId, sorszam, aktiv, partnerIds } = req.body;
 
+  if (typeof kliensId !== 'string' ||
+    !/^[a-zA-Z0-9-]{1,80}$/.test(kliensId) ||
+    !Number.isSafeInteger(sorszam) || sorszam < 1 ||
+    typeof aktiv !== 'boolean' ||
+    !Array.isArray(partnerIds) || partnerIds.length > 500 ||
+    partnerIds.some(id => !Number.isInteger(id) || id <= 0)) {
+    return res.status(400).send('Hibás online állapot');
+  }
+
+  const kulcs = req.munkamenetToken + ':' + kliensId;
+  const elozo = onlineJelenlet.get(kulcs);
+
+  if (!elozo || sorszam > elozo.sorszam) {
+    onlineJelenlet.set(kulcs, {
+      token: req.munkamenetToken,
+      sorszam,
+      aktiv,
+      frissitve: Date.now()
+    });
+  }
+
+  try {
+    const allapotok = {};
+    const ids = [...new Set(partnerIds)];
+
+    ids.forEach(id => { allapotok[id] = false; });
+
+    if (ids.length) {
+      const sorok = await dbPromise(`
+        SELECT s.Id FROM szemelyek s
+        WHERE s.Id IN (?)
+          AND NOT EXISTS (
+            SELECT 1 FROM tiltasok t
+            WHERE (t.tilto_id = ? AND t.tiltott_id = s.Id)
+               OR (t.tiltott_id = ? AND t.tilto_id = s.Id)
+          )
+      `, [ids, req.felhasznaloId, req.felhasznaloId]);
+
+      sorok.forEach(sor => {
+        allapotok[sor.Id] = felhasznaloOnline(sor.Id);
+      });
+    }
+
+    res.json(allapotok);
+  } catch (error) {
+    console.error('Online állapot lekérési hiba:', error);
+    res.status(500).send('Az online állapot lekérése sikertelen');
+  }
+});
+
+app.post('/uzenet-reakcio', vedett, async (req, res) => {
+  const uzenetId = req.body.uzenetId;
+  const emoji = req.body.emoji;
+  const engedelyezett = ['❤️', '😂', '😮', '😢', '👍'];
+
+  if (!Number.isInteger(uzenetId) || uzenetId <= 0 ||
+    (emoji !== null && !engedelyezett.includes(emoji))) {
+    return res.status(400).send('Hibás reakció');
+  }
+
+  try {
+    const sorok = await dbPromise(`
+      SELECT c.kuldo_id, c.aktualis_id, t.id_1, t.id_2,c.visszavont
+      FROM csevegesek c
+      JOIN talalkozas t ON t.Id = c.aktualis_id
+      WHERE c.id = ? AND (t.id_1 = ? OR t.id_2 = ?)
+      LIMIT 1
+    `, [uzenetId, req.felhasznaloId, req.felhasznaloId]);
+
+    if (!sorok.length) {
+      return res.status(403).send('Nincs hozzáférés ehhez az üzenethez');
+    }
+
+    const uzenet = sorok[0];
+
+    if (Number(uzenet.visszavont) === 1) {
+      return res.status(400).send('Visszavont üzenetre nem reagálhatsz');
+    }
+
+    if (Number(uzenet.kuldo_id) === req.felhasznaloId) {
+      return res.status(403).send('Saját üzenetre nem reagálhatsz');
+    }
+
+    const partnerId = Number(uzenet.kuldo_id);
+
+    if (await tiltottPar(req.felhasznaloId, partnerId)) {
+      return res.status(403).send('Tiltás miatt nem küldhető reakció');
+    }
+
+    if (emoji === null) {
+      await dbPromise(
+        'DELETE FROM uzenet_reakciok WHERE uzenet_id = ? AND felhasznalo_id = ?',
+        [uzenetId, req.felhasznaloId]
+      );
+    } else {
+      await dbPromise(`
+  INSERT INTO uzenet_reakciok (uzenet_id, felhasznalo_id, emoji)
+  SELECT c.id, ?, ?
+  FROM csevegesek c
+  WHERE c.id = ? AND c.visszavont = 0
+  ON DUPLICATE KEY UPDATE emoji = VALUES(emoji)
+`, [req.felhasznaloId, emoji, uzenetId]);
+    }
+
+    const aktualis = await dbPromise(
+      'SELECT felhasznalo_id, emoji FROM uzenet_reakciok WHERE uzenet_id = ?',
+      [uzenetId]
+    );
+
+    const reakcio = aktualis.length ? {
+      felhasznaloId: Number(aktualis[0].felhasznalo_id),
+      emoji: aktualis[0].emoji
+    } : null;
+
+    const esemeny = {
+      type: 'reaction',
+      talalkozasId: uzenet.aktualis_id,
+      uzenetId,
+      reakcio
+    };
+
+    for (const id of [
+      Number(uzenet.id_1),
+      Number(uzenet.id_2)
+    ]) {
+      const socket = kliensek.get(String(id));
+
+      if (socket?.readyState === WebSocket.OPEN &&
+        felhasznaloTokenAlapjan(socket.munkamenetToken) === id) {
+        socket.send(JSON.stringify(esemeny));
+      }
+    }
+
+    res.json(esemeny);
+  } catch (error) {
+    console.error('Reakció mentési hiba:', error);
+    res.status(500).send('A reakció mentése sikertelen');
+  }
+});
+
+
+app.post('/uzenet-visszavonas', vedett, async (req, res) => {
+  const uzenetId = req.body.uzenetId;
+
+  if (!Number.isInteger(uzenetId) || uzenetId <= 0) {
+    return res.status(400).send('Hibás üzenetazonosító');
+  }
+
+  const kapcsolat = mysql.createConnection({
+    host: db.config.host,
+    port: db.config.port,
+    user: db.config.user,
+    password: db.config.password,
+    database: db.config.database,
+    socketPath: db.config.socketPath,
+    charset: db.config.charset,
+    ssl: db.config.ssl
+  });
+
+  const query = (sql, params = []) => new Promise((resolve, reject) => {
+    kapcsolat.query(sql, params, (error, rows) => {
+      if (error) reject(error);
+      else resolve(rows);
+    });
+  });
+
+  let adat;
+  let kepUrl = null;
+
+  try {
+    await query('START TRANSACTION');
+
+    const sorok = await query(`
+      SELECT c.kuldo_id, c.aktualis_id, c.kep_url, c.visszavont,
+        t.id_1, t.id_2
+      FROM csevegesek c
+      JOIN talalkozas t ON t.Id = c.aktualis_id
+      WHERE c.id = ? AND c.kuldo_id = ?
+      FOR UPDATE
+    `, [uzenetId, req.felhasznaloId]);
+
+    if (!sorok.length) {
+      await query('ROLLBACK');
+      return res.status(403).send('Csak a saját üzeneted vonhatod vissza');
+    }
+
+    adat = sorok[0];
+    kepUrl = adat.kep_url;
+
+    await query(`
+      UPDATE csevegesek
+      SET visszavont = 1, uzenet = ?, kep_url = NULL
+      WHERE id = ? AND kuldo_id = ?
+    `, [encryptText(''), uzenetId, req.felhasznaloId]);
+
+    await query(
+      'DELETE FROM uzenet_reakciok WHERE uzenet_id = ?',
+      [uzenetId]
+    );
+
+    await query('COMMIT');
+  } catch (error) {
+    try { await query('ROLLBACK'); } catch (_) { }
+    console.error('Üzenet-visszavonási hiba:', error);
+    return res.status(500).send('Az üzenet visszavonása sikertelen');
+  } finally {
+    kapcsolat.end();
+  }
+
+  if (kepUrl && /^\/feltoltott_kepek\/[0-9a-f-]{36}\.(jpg|gif)$/i.test(kepUrl)) {
+    fs.unlink(path.join(kepMappa, path.basename(kepUrl)), error => {
+      if (error && error.code !== 'ENOENT') {
+        console.error('Visszavont kép törlési hiba:', error);
+      }
+    });
+  }
+
+  const esemeny = {
+    type: 'messageWithdrawn',
+    talalkozasId: adat.aktualis_id,
+    uzenetId
+  };
+
+  for (const id of [Number(adat.id_1), Number(adat.id_2)]) {
+    const socket = kliensek.get(String(id));
+
+    if (socket?.readyState === WebSocket.OPEN &&
+      felhasznaloTokenAlapjan(socket.munkamenetToken) === id) {
+      try {
+        socket.send(JSON.stringify(esemeny));
+      } catch (error) {
+        console.error('Visszavonási értesítés hiba:', error);
+      }
+    }
+  }
+
+  res.json(esemeny);
+});
 
 server.listen(
 
