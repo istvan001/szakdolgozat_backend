@@ -883,6 +883,17 @@ app.post('/szemelyfelvi', async (req, res) => {
   const lakhely = req.body.lakhely ? String(req.body.lakhely).trim() : null;
   const eletkor = req.body.eletkor == null ? null : Number(req.body.eletkor);
   const profilkepBase64 = req.body.profilkepBase64;
+  if (
+    !['Nő', 'Férfi', 'Egyéb'].includes(nem) ||
+    !lakhely ||
+    !Number.isInteger(eletkor) ||
+    eletkor < 18 ||
+    eletkor > 80
+  ) {
+    return res.status(400).send(
+      'A nem, a település és a 18–80 év közötti életkor megadása kötelező.'
+    );
+  }
 
   if (!Felhasznalo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(Email) || !Jelszo || Felhasznalo.length > 100 ||
     Email.length > 200 || Jelszo.length > 100 ||
@@ -1163,42 +1174,51 @@ app.post('/uzenet', vedett, async (req, res, next) => {
 
 app.get('/random/:id', vedett, async (req, res) => {
   const id = req.felhasznaloId;
-  if (Number(req.params.id) !== id)
+
+  if (Number(req.params.id) !== id) {
     return res.status(403).send('Nincs hozzáférés');
+  }
 
   try {
     const sajatSorok = await dbPromise(`
-      SELECT s.lakhely, s.eletkor,
+      SELECT s.lakhely, s.eletkor, s.nem,
         COALESCE(p.kor_min, 18) AS korMin,
         COALESCE(p.kor_max, 80) AS korMax,
-        COALESCE(p.tavolsag_km, 50) AS tavolsagKm
+        COALESCE(p.tavolsag_km, 50) AS tavolsagKm,
+        COALESCE(p.keresett_nem, 'Bárki') AS keresettNem
       FROM szemelyek s
       LEFT JOIN partner_keresesi_beallitasok p
         ON p.felhasznalo_id = s.Id
       WHERE s.Id = ?
     `, [id]);
 
-    if (!sajatSorok.length)
+    if (!sajatSorok.length) {
       return res.status(404).send('A profil nem található');
+    }
 
     const sajat = sajatSorok[0];
-    const sajatPont = telepulesPontok.get(telepulesNev(sajat.lakhely));
+    const sajatPont = telepulesPontok.get(
+      telepulesNev(sajat.lakhely)
+    );
 
-    if (!sajatPont)
+    if (!sajatPont) {
       return res.status(400).send(
         'A profilod településéhez nem található koordináta. Ellenőrizd a profilban megadott települést.'
       );
+    }
 
     const jeloltek = await dbPromise(`
       SELECT s.Id AS partnerId, s.Felhasznalo AS partnerNev,
-        s.lakhely, s.eletkor,
+        s.lakhely, s.eletkor, s.nem,
         COALESCE(p.kor_min, 18) AS korMin,
         COALESCE(p.kor_max, 80) AS korMax,
-        COALESCE(p.tavolsag_km, 50) AS tavolsagKm
+        COALESCE(p.tavolsag_km, 50) AS tavolsagKm,
+        COALESCE(p.keresett_nem, 'Bárki') AS keresettNem
       FROM szemelyek s
       LEFT JOIN partner_keresesi_beallitasok p
         ON p.felhasznalo_id = s.Id
       WHERE s.Id <> ?
+        AND COALESCE(s.is_admin, 0) = 0
         AND NOT EXISTS (
           SELECT 1 FROM tiltasok b
           WHERE (b.tilto_id = ? AND b.tiltott_id = s.Id)
@@ -1212,32 +1232,39 @@ app.get('/random/:id', vedett, async (req, res) => {
     `, [id, id, id, id, id]);
 
     const talalatok = jeloltek.filter(jelolt => {
+      if (
+        sajat.keresettNem !== 'Bárki' &&
+        jelolt.nem !== sajat.keresettNem
+      ) return false;
+
       const jeloltPont = telepulesPontok.get(
         telepulesNev(jelolt.lakhely)
       );
+
       if (!jeloltPont) return false;
 
       const tavolsag = legvonalKm(sajatPont, jeloltPont);
-      if (tavolsag > Number(sajat.tavolsagKm) ||
-        tavolsag > Number(jelolt.tavolsagKm)) return false;
+
+      if (
+        !Number.isFinite(tavolsag) ||
+        tavolsag > Number(sajat.tavolsagKm)
+      ) return false;
 
       const partnerKorMegfelel = jelolt.eletkor == null
         ? Number(sajat.korMin) === 18 && Number(sajat.korMax) === 80
         : Number(jelolt.eletkor) >= Number(sajat.korMin) &&
         Number(jelolt.eletkor) <= Number(sajat.korMax);
 
-      const sajatKorMegfelel = sajat.eletkor == null
-        ? Number(jelolt.korMin) === 18 && Number(jelolt.korMax) === 80
-        : Number(sajat.eletkor) >= Number(jelolt.korMin) &&
-        Number(sajat.eletkor) <= Number(jelolt.korMax);
-
-      return partnerKorMegfelel && sajatKorMegfelel;
+      return partnerKorMegfelel;
     });
 
-    if (!talalatok.length)
+    console.log('[Partnerkeresés] Találatok:', talalatok.length);
+
+    if (!talalatok.length) {
       return res.status(404).send(
         'Nincs a keresési beállításoknak megfelelő új partner'
       );
+    }
 
     const partner = talalatok[
       Math.floor(Math.random() * talalatok.length)
@@ -2067,19 +2094,31 @@ app.get('/tiltottak', vedett, async (req, res) => {
 app.get('/partner-beallitasok', vedett, async (req, res) => {
   try {
     const rows = await dbPromise(
-      'SELECT kor_min AS korMin, kor_max AS korMax, tavolsag_km AS tavolsagKm FROM partner_keresesi_beallitasok WHERE felhasznalo_id = ?',
+      `SELECT kor_min AS korMin, kor_max AS korMax,
+        tavolsag_km AS tavolsagKm, keresett_nem AS keresettNem
+       FROM partner_keresesi_beallitasok
+       WHERE felhasznalo_id = ?`,
       [req.felhasznaloId]
     );
-    res.json(rows[0] || { korMin: 18, korMax: 80, tavolsagKm: 50 });
+
+    res.json(rows[0] || {
+      korMin: 18,
+      korMax: 80,
+      tavolsagKm: 50,
+      keresettNem: 'Bárki'
+    });
   } catch (error) {
     console.error('Partnerkeresési beállítások lekérési hiba:', error);
     res.status(500).send('A beállítások lekérése sikertelen');
   }
 });
+
 app.post('/partner-beallitasok', vedett, async (req, res) => {
   const korMin = Number(req.body.korMin);
   const korMax = Number(req.body.korMax);
   const tavolsagKm = Number(req.body.tavolsagKm);
+  const keresettNem = req.body.keresettNem ?? 'Bárki';
+
   if (
     !Number.isInteger(korMin) ||
     !Number.isInteger(korMax) ||
@@ -2088,44 +2127,29 @@ app.post('/partner-beallitasok', vedett, async (req, res) => {
     korMin > korMax ||
     !Number.isInteger(tavolsagKm) ||
     tavolsagKm < 10 ||
-    tavolsagKm > 500
+    tavolsagKm > 500 ||
+    !['Bárki', 'Nő', 'Férfi', 'Egyéb'].includes(keresettNem)
   ) {
-    return res.status(400).send('Érvénytelen korhatár vagy távolság');
-  }
-  try {
-    await dbPromise(`INSERT INTO partner_keresesi_beallitasok (felhasznalo_id, kor_min, kor_max, tavolsag_km)
-      VALUES (?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE kor_min = VALUES(kor_min), kor_max = VALUES(kor_max), tavolsag_km = VALUES(tavolsag_km)`,
-      [req.felhasznaloId, korMin, korMax, tavolsagKm]);
-    res.json({ sikeres: true });
-  }
-  catch (error) {
-    console.error('Partnerkeresési beállítások mentési hiba:', error);
-    res.status(500).send('A beállítások mentése sikertelen');
-  }
-});
-
-app.post('/tiltas-feloldasa', vedett, async (req, res) => {
-  const partnerId = Number(req.body.partnerId);
-
-  if (!Number.isInteger(partnerId) || partnerId <= 0 || partnerId === req.felhasznaloId) {
-    return res.status(400).send('Hibás felhasználóazonosító');
+    return res.status(400).send('Érvénytelen keresési beállítások');
   }
 
   try {
-    const result = await dbPromise(
-      'DELETE FROM tiltasok WHERE tilto_id = ? AND tiltott_id = ?',
-      [req.felhasznaloId, partnerId]
+    await dbPromise(
+      `INSERT INTO partner_keresesi_beallitasok
+        (felhasznalo_id, kor_min, kor_max, tavolsag_km, keresett_nem)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+        kor_min = VALUES(kor_min),
+        kor_max = VALUES(kor_max),
+        tavolsag_km = VALUES(tavolsag_km),
+        keresett_nem = VALUES(keresett_nem)`,
+      [req.felhasznaloId, korMin, korMax, tavolsagKm, keresettNem]
     );
-
-    if (!result.affectedRows) {
-      return res.status(404).send('Ez a felhasználó nincs letiltva általad');
-    }
 
     res.json({ sikeres: true });
   } catch (error) {
-    console.error('Tiltás feloldási hiba:', error);
-    res.status(500).send('A tiltás feloldása sikertelen');
+    console.error('Partnerkeresési beállítások mentési hiba:', error);
+    res.status(500).send('A beállítások mentése sikertelen');
   }
 });
 
